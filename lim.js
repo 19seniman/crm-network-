@@ -9,15 +9,16 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 // ============================================================
 const CONFIG = {
   INIT_DATA:                process.env.INIT_DATA                || "",
-  CLAIM_INTERVAL_MS:        parseInt(process.env.CLAIM_INTERVAL_MS)        || 5 * 60 * 1000,
-  ENERGY_BOOST_INTERVAL_MS: parseInt(process.env.ENERGY_BOOST_INTERVAL_MS) || 60 * 1000,
+  CLAIM_INTERVAL_MS:        parseInt(process.env.CLAIM_INTERVAL_MS)        || 5  * 60 * 1000,
+  ENERGY_BOOST_INTERVAL_MS: parseInt(process.env.ENERGY_BOOST_INTERVAL_MS) || 1  * 60 * 1000,
+  MINING_BOOST_INTERVAL_MS: parseInt(process.env.MINING_BOOST_INTERVAL_MS) || 4  * 60 * 60 * 1000,
+  TASK_INTERVAL_MS:         parseInt(process.env.TASK_INTERVAL_MS)         || 10 * 60 * 1000,
   AUTO_LOOP:                process.env.AUTO_LOOP !== "false",
   VERBOSE:                  process.env.VERBOSE  === "true",
 };
 
 const BASE_URL = "https://crmnetwork.xyz";
 
-// Endpoint _serverFn hashes
 const ENDPOINTS = {
   USER_INFO:     "2e857a8661ed051f72427143277d80bab9f7d7a3291576d0e9fc51f1a8bfdd99",
   BALANCE:       "62fb8cd3427e2b52cffe2025ec235b259a81792855f4e7d0716f7a8933e9ee37",
@@ -26,22 +27,36 @@ const ENDPOINTS = {
   REFERRAL:      "315599a52f04634a5fca4d465bc9186d48c8242f29b3c7bd621bfd46536f35e7",
   CLAIM:         "300377a39126958995cb42ba5717a5e58e7cacfe3d7893249b420ebb732a1899",
   ENERGY_BOOST:  "3d59b269221e6b3d20bda06446edbc61c15c0a38818fdbe5a0bb71e01fb9ba3f",
+  TASK_COMPLETE: "c427fd5729a7aac8f19d87d1d6c1206495637371611444c2caa3e417c4394b9e",
+};
+
+const MINING_BOOST_KEYWORDS = [
+  "mining power", "power boost", "mining boost",
+  "boost mining", "energy mining", "mine boost",
+];
+
+// State balance session
+const SESSION = {
+  balanceBefore: null,
+  balanceAfter:  null,
+  totalEarned:   0,
+  claimCount:    0,
+  startTime:     Date.now(),
 };
 
 // ============================================================
 // HTTP HELPERS
 // ============================================================
-function getHeaders(withBody = false) {
-  const h = {
+function getHeaders() {
+  return {
     "accept":          "application/x-tss-framed, application/x-ndjson, application/json",
     "accept-language": "en-US,en;q=0.9",
+    "content-type":    "application/json",
     "origin":          "https://crmnetwork.xyz",
     "referer":         "https://crmnetwork.xyz/",
     "user-agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "x-tsr-serverfn":  "true",
   };
-  if (withBody) h["content-type"] = "application/json";
-  return h;
 }
 
 function makeBody(initData, extraKeys = [], extraVals = []) {
@@ -70,13 +85,13 @@ async function callEndpoint(hash, initData, extraKeys = [], extraVals = []) {
   try {
     const res  = await fetch(url, {
       method:  "POST",
-      headers: getHeaders(true),
+      headers: getHeaders(),
       body:    makeBody(initData, extraKeys, extraVals),
     });
     const text = await res.text();
     if (CONFIG.VERBOSE) {
-      console.log(`  [${hash.slice(0, 8)}...] HTTP ${res.status}`);
-      console.log("  Response:", text.slice(0, 500));
+      console.log(`    [${hash.slice(0, 8)}...] HTTP ${res.status}`);
+      console.log("    Raw:", text.slice(0, 600));
     }
     try {
       const parsed = text.trim().split("\n").filter(Boolean).map(l => JSON.parse(l));
@@ -90,8 +105,85 @@ async function callEndpoint(hash, initData, extraKeys = [], extraVals = []) {
 }
 
 // ============================================================
+// BALANCE PARSER
+// Coba ekstrak nilai balance/amount dari response server
+// ============================================================
+function extractBalance(result) {
+  try {
+    const flat = JSON.stringify(result.data || result.raw || "");
+    // Cari pola angka setelah key balance/amount/coins/token/crm
+    const patterns = [
+      /"(?:balance|amount|coins?|tokens?|crm|total)":\s*([\d.]+)/i,
+      /"(?:value|reward|earned)":\s*([\d.]+)/i,
+    ];
+    for (const pattern of patterns) {
+      const match = flat.match(pattern);
+      if (match) return parseFloat(match[1]);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function extractClaimedAmount(result) {
+  try {
+    const flat = JSON.stringify(result.data || result.raw || "");
+    const patterns = [
+      /"(?:claimed|reward|earned|amount|mining_reward|mined)":\s*([\d.]+)/i,
+      /"(?:crm|token)s?_earned":\s*([\d.]+)/i,
+    ];
+    for (const pattern of patterns) {
+      const match = flat.match(pattern);
+      if (match) return parseFloat(match[1]);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Tampilkan ringkasan balance
+function printBalanceSummary(label, before, after, claimed = null) {
+  console.log("  ┌─────────────────────────────────┐");
+  if (before !== null) console.log(`  │ 💼 Balance Sebelum : ${String(before).padEnd(10)} CRM │`);
+  if (claimed !== null) console.log(`  │ 💎 Hasil Claim     : +${String(claimed).padEnd(9)} CRM │`);
+  if (after !== null)  console.log(`  │ 💰 Balance Sekarang: ${String(after).padEnd(10)} CRM │`);
+  if (before !== null && after !== null) {
+    const diff = parseFloat((after - before).toFixed(6));
+    if (diff > 0) console.log(`  │ 📈 Selisih         : +${String(diff).padEnd(9)} CRM │`);
+  }
+  console.log("  └─────────────────────────────────┘");
+}
+
+// Tampilkan statistik sesi
+function printSessionStats() {
+  const elapsed  = Date.now() - SESSION.startTime;
+  const hours    = Math.floor(elapsed / 3600000);
+  const minutes  = Math.floor((elapsed % 3600000) / 60000);
+  console.log("\n  ╔═══════════════════════════════════╗");
+  console.log("  ║        STATISTIK SESI             ║");
+  console.log("  ╠═══════════════════════════════════╣");
+  console.log(`  ║ ⏱  Durasi      : ${String(hours + "j " + minutes + "m").padEnd(17)} ║`);
+  console.log(`  ║ 🎯 Total Claim : ${String(SESSION.claimCount + " kali").padEnd(17)} ║`);
+  console.log(`  ║ 💎 Total Dapat : ${String(SESSION.totalEarned.toFixed(4) + " CRM").padEnd(17)} ║`);
+  if (SESSION.balanceAfter !== null)
+    console.log(`  ║ 💰 Balance     : ${String(SESSION.balanceAfter.toFixed(4) + " CRM").padEnd(17)} ║`);
+  console.log("  ╚═══════════════════════════════════╝");
+}
+
+// ============================================================
 // ACTIONS
 // ============================================================
+async function getBalance(initData) {
+  const r = await callEndpoint(ENDPOINTS.BALANCE, initData);
+  if (r.ok) {
+    const bal = extractBalance(r);
+    return { ok: true, balance: bal, raw: r };
+  }
+  return { ok: false, balance: null };
+}
+
 async function getUserInfo(initData) {
   process.stdout.write("  📊 User info... ");
   const r = await callEndpoint(ENDPOINTS.USER_INFO, initData);
@@ -106,154 +198,260 @@ async function getMiningInfo(initData) {
   return r;
 }
 
-async function getBalance(initData) {
-  process.stdout.write("  💰 Balance... ");
-  const r = await callEndpoint(ENDPOINTS.BALANCE, initData);
-  console.log(r.ok ? "✅" : `❌ (${r.status || r.error})`);
-  return r;
-}
-
 async function claimReward(initData) {
   const key = randomUUID();
-  process.stdout.write(`  🎯 Claim (key: ${key.slice(0, 8)}...)... `);
+  console.log(`  🎯 Claim mining (key: ${key.slice(0, 8)}...)`);
+
+  // Ambil balance SEBELUM claim
+  process.stdout.write("  💼 Cek balance awal... ");
+  const before = await getBalance(initData);
+  console.log(before.ok ? `✅ ${before.balance !== null ? before.balance + " CRM" : "(parsing...)"}` : "❌");
+
+  // Lakukan claim
+  process.stdout.write("  🚀 Mengirim claim... ");
   const r = await callEndpoint(
-    ENDPOINTS.CLAIM,
-    initData,
+    ENDPOINTS.CLAIM, initData,
     ["idempotency_key"],
     [{ t: 1, s: key }]
   );
+
   if (r.ok) {
     console.log("✅ BERHASIL!");
+    const claimed = extractClaimedAmount(r);
+
+    // Ambil balance SETELAH claim
+    await sleep(1000); // tunggu server update
+    process.stdout.write("  💰 Cek balance akhir... ");
+    const after = await getBalance(initData);
+    console.log(after.ok ? `✅ ${after.balance !== null ? after.balance + " CRM" : "(parsing...)"}` : "❌");
+
+    // Hitung selisih
+    const diff = (before.balance !== null && after.balance !== null)
+      ? parseFloat((after.balance - before.balance).toFixed(6))
+      : claimed;
+
+    // Update session stats
+    SESSION.balanceBefore = before.balance;
+    SESSION.balanceAfter  = after.balance;
+    SESSION.claimCount++;
+    if (diff && diff > 0) SESSION.totalEarned = parseFloat((SESSION.totalEarned + diff).toFixed(6));
+
+    // Tampilkan ringkasan balance
+    printBalanceSummary(
+      "Claim Mining",
+      before.balance,
+      after.balance,
+      diff !== null && diff > 0 ? diff : claimed
+    );
+
     if (CONFIG.VERBOSE) console.log("  Data:", JSON.stringify(r.data, null, 2));
-    else {
-      const flat = JSON.stringify(r.data || r.raw || "");
-      if (/reward|token|amount|balance/i.test(flat)) {
-        console.log("  📦", flat.slice(0, 300));
-      }
-    }
   } else {
-    console.log(`❌ GAGAL (${r.status || r.error})`);
+    console.log(`  ❌ Claim GAGAL (${r.status || r.error})`);
     if (r.raw) console.log("  Detail:", r.raw.slice(0, 300));
   }
   return r;
 }
 
 async function energyBoost(initData) {
-  process.stdout.write("  ⚡ Energy Boost... ");
+  process.stdout.write(`[${timestamp()}] ⚡ Energy Boost... `);
   const r = await callEndpoint(ENDPOINTS.ENERGY_BOOST, initData);
+  console.log(r.ok ? "✅" : `❌ (${r.status || r.error})`);
+  return r;
+}
+
+async function claimMiningBoost(initData) {
+  console.log(`[${timestamp()}] 🚀 Mining Power Boost Claim`);
+
+  process.stdout.write("  💼 Cek balance awal... ");
+  const before = await getBalance(initData);
+  console.log(before.ok ? `✅ ${before.balance !== null ? before.balance + " CRM" : "(parsing...)"}` : "❌");
+
+  process.stdout.write("  🚀 Mengirim boost claim... ");
+  const r = await callEndpoint(ENDPOINTS.TASK_COMPLETE, initData);
+
   if (r.ok) {
     console.log("✅ BERHASIL!");
-    if (CONFIG.VERBOSE) console.log("  Data:", JSON.stringify(r.data, null, 2));
-    else {
-      const flat = JSON.stringify(r.data || r.raw || "");
-      if (/energy|boost|power|mana/i.test(flat)) {
-        console.log("  ⚡", flat.slice(0, 300));
-      }
-    }
+    await sleep(1000);
+
+    process.stdout.write("  💰 Cek balance akhir... ");
+    const after = await getBalance(initData);
+    console.log(after.ok ? `✅ ${after.balance !== null ? after.balance + " CRM" : "(parsing...)"}` : "❌");
+
+    const diff = (before.balance !== null && after.balance !== null)
+      ? parseFloat((after.balance - before.balance).toFixed(6)) : null;
+
+    SESSION.balanceAfter = after.balance;
+    if (diff && diff > 0) SESSION.totalEarned = parseFloat((SESSION.totalEarned + diff).toFixed(6));
+
+    printBalanceSummary("Mining Power Boost", before.balance, after.balance, diff);
   } else {
-    console.log(`❌ GAGAL (${r.status || r.error})`);
-    if (r.raw) console.log("  Detail:", r.raw.slice(0, 300));
+    console.log(`  ❌ GAGAL (${r.status || r.error})`);
   }
   return r;
 }
 
-// ============================================================
-// UTILS
-// ============================================================
-function timestamp() {
-  return new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
+async function fetchTasks(initData) {
+  const r = await callEndpoint(ENDPOINTS.TASKS, initData);
+  if (!r.ok) return [];
+  try {
+    const flat = JSON.stringify(r.data || []);
+    const matches = [...flat.matchAll(/"id"\s*:\s*"?(\w+)"?[^}]*?"(?:title|name|type)"\s*:\s*"([^"]+)"/g)];
+    if (matches.length > 0) return matches.map(m => ({ id: m[1], title: m[2] }));
+    return [];
+  } catch { return []; }
 }
 
-function formatDuration(ms) {
-  const m = Math.floor(ms / 60000);
-  const s = Math.floor((ms % 60000) / 1000);
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+function isMiningBoostTask(taskTitle = "") {
+  return MINING_BOOST_KEYWORDS.some(kw => taskTitle.toLowerCase().includes(kw));
 }
 
-// Countdown timer di terminal
-function startCountdown(label, totalMs, onDone) {
-  let remaining = Math.floor(totalMs / 1000);
-  const id = setInterval(() => {
-    remaining--;
-    if (remaining <= 0) {
-      clearInterval(id);
-      onDone();
+async function completeTask(initData, task) {
+  process.stdout.write(`    🔸 "${task.title}" (id: ${task.id})... `);
+  const r = await callEndpoint(
+    ENDPOINTS.TASK_COMPLETE, initData,
+    ["task_id"],
+    [{ t: 1, s: String(task.id) }]
+  );
+  const reward = extractClaimedAmount(r);
+  if (r.ok) {
+    console.log(`✅${reward !== null ? ` +${reward} CRM` : ""}`);
+    if (reward && reward > 0) SESSION.totalEarned = parseFloat((SESSION.totalEarned + reward).toFixed(6));
+  } else {
+    console.log(`❌ (${r.status || r.error})`);
+  }
+  return r;
+}
+
+async function runTaskCycle(initData) {
+  console.log(`\n[${timestamp()}] 📋 TASK CYCLE`);
+  process.stdout.write("  📥 Mengambil daftar task... ");
+  const tasks = await fetchTasks(initData);
+
+  if (tasks.length === 0) {
+    console.log("  ⚠️  Tidak ada task / semua sudah selesai");
+    return;
+  }
+  console.log(`✅ ${tasks.length} task ditemukan`);
+
+  let done = 0, skip = 0;
+  for (const task of tasks) {
+    if (isMiningBoostTask(task.title)) {
+      console.log(`    ⏭️  Skip "${task.title}" — ditangani Mining Boost timer`);
+      skip++;
+      continue;
     }
-  }, 1000);
-  return id;
+    await completeTask(initData, task);
+    done++;
+    await sleep(1500);
+  }
+  console.log(`  ✔️  ${done} task selesai, ${skip} dilewati`);
 }
 
 // ============================================================
-// SIKLUS
+// CLAIM CYCLE
 // ============================================================
 async function runClaimCycle(initData) {
   console.log(`\n┌─ [${timestamp()}] 🔄 CLAIM CYCLE`);
   await getUserInfo(initData);
   await getMiningInfo(initData);
   await claimReward(initData);
-  await getBalance(initData);
+
+  // Tampilkan stats sesi setiap klaim
+  printSessionStats();
   console.log(`└─ Selesai`);
 }
 
-async function runBoostCycle(initData) {
-  process.stdout.write(`\n[${timestamp()}] `);
-  await energyBoost(initData);
+// ============================================================
+// UTILS
+// ============================================================
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function timestamp() {
+  return new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
+}
+
+function formatDuration(ms) {
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  if (h > 0) return `${h}j ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 // ============================================================
 // MAIN
 // ============================================================
 async function main() {
-  console.log("╔══════════════════════════════════════════════╗");
-  console.log("║    CRM Network By 19Seniman  ║");
-  console.log("╚══════════════════════════════════════════════╝");
+  console.log("╔══════════════════════════════════════════════════╗");
+  console.log("║  CRM Network Auto Bot                            ║");
+  console.log("║  Claim + Energy Boost + Task + Mining Boost      ║");
+  console.log("╚══════════════════════════════════════════════════╝");
 
   if (!CONFIG.INIT_DATA || CONFIG.INIT_DATA.includes("GANTI_DENGAN_PUNYA_KAMU")) {
-    console.error("\n❌ ERROR: INIT_DATA belum diisi!");
-    console.error("   1. Salin .env.example menjadi .env");
-    console.error("   2. Isi nilai INIT_DATA dengan initData dari akun Telegram kamu");
-    console.error("   3. Jalankan ulang script ini\n");
+    console.error("\n❌ ERROR: INIT_DATA belum diisi di file .env!\n");
     process.exit(1);
   }
 
   console.log("\n📋 Konfigurasi:");
-  console.log(`   INIT_DATA      : ${CONFIG.INIT_DATA.slice(0, 40)}...`);
-  console.log(`   AUTO_LOOP      : ${CONFIG.AUTO_LOOP}`);
-  console.log(`   Claim interval : setiap ${formatDuration(CONFIG.CLAIM_INTERVAL_MS)}`);
-  console.log(`   Energy Boost   : setiap ${formatDuration(CONFIG.ENERGY_BOOST_INTERVAL_MS)}`);
-  console.log(`   VERBOSE        : ${CONFIG.VERBOSE}`);
-  console.log("\n" + "─".repeat(48));
+  console.log(`   INIT_DATA         : ${CONFIG.INIT_DATA.slice(0, 40)}...`);
+  console.log(`   🎯 Claim          : setiap ${formatDuration(CONFIG.CLAIM_INTERVAL_MS)}`);
+  console.log(`   ⚡ Energy Boost   : setiap ${formatDuration(CONFIG.ENERGY_BOOST_INTERVAL_MS)}`);
+  console.log(`   🚀 Mining Boost   : setiap ${formatDuration(CONFIG.MINING_BOOST_INTERVAL_MS)}`);
+  console.log(`   📋 Task Check     : setiap ${formatDuration(CONFIG.TASK_INTERVAL_MS)}`);
+  console.log(`   AUTO_LOOP         : ${CONFIG.AUTO_LOOP}`);
+  console.log(`   VERBOSE           : ${CONFIG.VERBOSE}`);
+  console.log("\n" + "─".repeat(52));
 
   const initData = CONFIG.INIT_DATA;
 
-  // Jalankan claim pertama langsung
+  // Jalankan semua langsung saat start
   await runClaimCycle(initData);
+  await energyBoost(initData);
+  await claimMiningBoost(initData);
+  await runTaskCycle(initData);
 
-  // Jalankan boost pertama langsung
-  await runBoostCycle(initData);
+  if (!CONFIG.AUTO_LOOP) {
+    printSessionStats();
+    return;
+  }
 
-  if (!CONFIG.AUTO_LOOP) return;
-
-  console.log(`\n⏰ Scheduler aktif — Ctrl+C untuk berhenti`);
-  console.log(`   ⚡ Energy Boost : tiap ${formatDuration(CONFIG.ENERGY_BOOST_INTERVAL_MS)}`);
-  console.log(`   🎯 Claim        : tiap ${formatDuration(CONFIG.CLAIM_INTERVAL_MS)}`);
+  console.log(`\n⏰ Semua scheduler aktif — Ctrl+C untuk berhenti`);
+  console.log(`   ⚡ Energy Boost   : tiap ${formatDuration(CONFIG.ENERGY_BOOST_INTERVAL_MS)}`);
+  console.log(`   🎯 Claim Mining   : tiap ${formatDuration(CONFIG.CLAIM_INTERVAL_MS)}`);
+  console.log(`   🚀 Mining Boost   : tiap ${formatDuration(CONFIG.MINING_BOOST_INTERVAL_MS)}`);
+  console.log(`   📋 Task Check     : tiap ${formatDuration(CONFIG.TASK_INTERVAL_MS)}`);
 
   const timers = [];
 
-  // Timer energy boost (tiap 1 menit)
+  // ⚡ Energy boost — tiap 1 menit
   timers.push(setInterval(async () => {
-    await runBoostCycle(initData);
+    await energyBoost(initData);
   }, CONFIG.ENERGY_BOOST_INTERVAL_MS));
 
-  // Timer claim (tiap 5 menit / sesuai config)
+  // 🎯 Claim mining — tiap 5 menit
   timers.push(setInterval(async () => {
     await runClaimCycle(initData);
   }, CONFIG.CLAIM_INTERVAL_MS));
 
-  // Graceful shutdown
+  // 🚀 Mining power boost — tiap 4 jam
+  timers.push(setInterval(async () => {
+    await claimMiningBoost(initData);
+  }, CONFIG.MINING_BOOST_INTERVAL_MS));
+
+  // 📋 Task check — tiap 10 menit
+  timers.push(setInterval(async () => {
+    await runTaskCycle(initData);
+  }, CONFIG.TASK_INTERVAL_MS));
+
+  // Graceful shutdown + tampilkan stats akhir
   process.on("SIGINT", () => {
     timers.forEach(t => clearInterval(t));
-    console.log("\n\n👋 Script dihentikan.");
+    console.log("\n");
+    printSessionStats();
+    console.log("\n👋 Script dihentikan.");
     process.exit(0);
   });
 }
