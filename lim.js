@@ -105,55 +105,121 @@ async function callEndpoint(hash, initData, extraKeys = [], extraVals = []) {
 }
 
 // ============================================================
-// BALANCE PARSER
-// Coba ekstrak nilai balance/amount dari response server
+// TSS RESPONSE DECODER
+// Format server: {"t":10,"p":{"k":["result","error","context"],"v":[...]}}
+// k = nama key, v = nilai (index sama)
 // ============================================================
-function extractBalance(result) {
+
+// Decode satu node TSS menjadi nilai JS biasa
+function decodeTSS(node) {
+  if (node === null || node === undefined) return null;
+  const t = node.t;
+
+  // t:1 = string, t:2 = number/bool, t:25 = Error object
+  if (t === 1)  return node.s ?? null;
+  if (t === 2)  return node.s ?? null;
+  if (t === 3)  return node.s ?? null; // boolean
+  if (t === 25) {
+    // Error node — ekstrak pesan
+    const msg = node.s?.message;
+    return msg ? decodeTSS(msg) : null;
+  }
+  if (t === 10) {
+    // Object node — rekursif decode k/v pairs
+    if (!node.p || !node.p.k) return {};
+    const obj = {};
+    node.p.k.forEach((key, i) => {
+      obj[key] = decodeTSS(node.p.v?.[i]);
+    });
+    return obj;
+  }
+  if (t === 4 || t === 5) {
+    // Array node
+    return (node.v || []).map(decodeTSS);
+  }
+  // Fallback: kembalikan s atau node itu sendiri
+  return node.s ?? node;
+}
+
+// Parse seluruh response menjadi object JS
+function parseResponse(result) {
   try {
-    const flat = JSON.stringify(result.data || result.raw || "");
-    // Cari pola angka setelah key balance/amount/coins/token/crm
-    const patterns = [
-      /"(?:balance|amount|coins?|tokens?|crm|total)":\s*([\d.]+)/i,
-      /"(?:value|reward|earned)":\s*([\d.]+)/i,
-    ];
-    for (const pattern of patterns) {
-      const match = flat.match(pattern);
-      if (match) return parseFloat(match[1]);
+    const lines = result.data || [];
+    for (const line of lines) {
+      if (line && line.t === 10 && line.p?.k) {
+        return decodeTSS(line);
+      }
     }
     return null;
   } catch {
     return null;
   }
+}
+
+// Cek apakah response mengandung auth error
+function isAuthError(parsed) {
+  if (!parsed) return false;
+  const errMsg = String(parsed.error || "").toLowerCase();
+  return errMsg.includes("invalid_signature") ||
+         errMsg.includes("tg_auth") ||
+         errMsg.includes("invalid initdata");
+}
+
+// Cari nilai numerik secara rekursif dari object
+function findNumber(obj, keys) {
+  if (!obj || typeof obj !== "object") return null;
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) {
+      const val = parseFloat(obj[key]);
+      if (!isNaN(val)) return val;
+    }
+  }
+  // Rekursif ke child objects
+  for (const val of Object.values(obj)) {
+    if (typeof val === "object") {
+      const found = findNumber(val, keys);
+      if (found !== null) return found;
+    }
+  }
+  return null;
+}
+
+function extractBalance(result) {
+  try {
+    const parsed = parseResponse(result);
+    if (!parsed) return null;
+    const data = parsed.result || parsed;
+    return findNumber(data, [
+      "balance", "total_balance", "coin", "coins",
+      "crm", "token", "tokens", "amount", "total",
+    ]);
+  } catch { return null; }
 }
 
 function extractClaimedAmount(result) {
   try {
-    const flat = JSON.stringify(result.data || result.raw || "");
-    const patterns = [
-      /"(?:claimed|reward|earned|amount|mining_reward|mined)":\s*([\d.]+)/i,
-      /"(?:crm|token)s?_earned":\s*([\d.]+)/i,
-    ];
-    for (const pattern of patterns) {
-      const match = flat.match(pattern);
-      if (match) return parseFloat(match[1]);
-    }
-    return null;
-  } catch {
-    return null;
-  }
+    const parsed = parseResponse(result);
+    if (!parsed) return null;
+    const data = parsed.result || parsed;
+    return findNumber(data, [
+      "claimed", "reward", "earned", "mining_reward",
+      "mined", "amount", "crm_earned", "tokens_earned",
+    ]);
+  } catch { return null; }
 }
 
 // Tampilkan ringkasan balance
-function printBalanceSummary(label, before, after, claimed = null) {
-  console.log("  ┌─────────────────────────────────┐");
-  if (before !== null) console.log(`  │ 💼 Balance Sebelum : ${String(before).padEnd(10)} CRM │`);
-  if (claimed !== null) console.log(`  │ 💎 Hasil Claim     : +${String(claimed).padEnd(9)} CRM │`);
-  if (after !== null)  console.log(`  │ 💰 Balance Sekarang: ${String(after).padEnd(10)} CRM │`);
+function printBalanceSummary(before, after, claimed = null) {
+  const line = (label, val) => `  │ ${label}: ${String(val ?? "N/A").padEnd(14)} CRM │`;
+  console.log("  ┌──────────────────────────────────────┐");
+  if (before  !== null) console.log(line("💼 Balance Sebelum ", before));
+  if (claimed !== null && claimed > 0) console.log(line("💎 Hasil Claim     ", "+" + claimed));
+  if (after   !== null) console.log(line("💰 Balance Sekarang", after));
   if (before !== null && after !== null) {
     const diff = parseFloat((after - before).toFixed(6));
-    if (diff > 0) console.log(`  │ 📈 Selisih         : +${String(diff).padEnd(9)} CRM │`);
+    if (diff > 0) console.log(line("📈 Selisih         ", "+" + diff));
   }
-  console.log("  └─────────────────────────────────┘");
+  console.log("  └──────────────────────────────────────┘");
 }
 
 // Tampilkan statistik sesi
@@ -175,9 +241,27 @@ function printSessionStats() {
 // ============================================================
 // ACTIONS
 // ============================================================
+// Cek auth error dari parsed response dan tampilkan peringatan
+function checkAuth(result, label = "") {
+  const parsed = parseResponse(result);
+  if (isAuthError(parsed)) {
+    console.log("\n  ┌──────────────────────────────────────────────┐");
+    console.log("  │ ⚠️  INIT DATA EXPIRED / TIDAK VALID           │");
+    console.log("  │ Perbarui INIT_DATA di file .env kamu:        │");
+    console.log("  │ 1. Buka app CRM di Telegram                  │");
+    console.log("  │ 2. DevTools → Network → cari request terbaru │");
+    console.log("  │ 3. Salin nilai _initData → paste ke .env     │");
+    console.log("  └──────────────────────────────────────────────┘");
+    return false;
+  }
+  return true;
+}
+
 async function getBalance(initData) {
   const r = await callEndpoint(ENDPOINTS.BALANCE, initData);
   if (r.ok) {
+    const parsed = parseResponse(r);
+    if (isAuthError(parsed)) return { ok: false, balance: null, authError: true };
     const bal = extractBalance(r);
     return { ok: true, balance: bal, raw: r };
   }
@@ -187,67 +271,77 @@ async function getBalance(initData) {
 async function getUserInfo(initData) {
   process.stdout.write("  📊 User info... ");
   const r = await callEndpoint(ENDPOINTS.USER_INFO, initData);
-  console.log(r.ok ? "✅" : `❌ (${r.status || r.error})`);
+  const parsed = parseResponse(r);
+  if (isAuthError(parsed)) {
+    console.log("❌ AUTH EXPIRED");
+    checkAuth(r);
+    return r;
+  }
+  // Tampilkan nama user jika ada
+  const name = parsed?.result?.first_name || parsed?.result?.username || null;
+  console.log(`✅${name ? ` (${name})` : ""}`);
   return r;
 }
 
 async function getMiningInfo(initData) {
   process.stdout.write("  ⛏️  Mining info... ");
   const r = await callEndpoint(ENDPOINTS.MINING_INFO, initData);
-  console.log(r.ok ? "✅" : `❌ (${r.status || r.error})`);
+  const parsed = parseResponse(r);
+  if (isAuthError(parsed)) { console.log("❌ AUTH EXPIRED"); return r; }
+  // Tampilkan mining rate jika ada
+  const rate = findNumber(parsed?.result || {}, ["rate", "mining_rate", "per_hour", "speed"]);
+  console.log(`✅${rate !== null ? ` (${rate} CRM/jam)` : ""}`);
   return r;
+}
+
+function balanceLabel(val) {
+  return val !== null ? `${val} CRM` : "N/A";
 }
 
 async function claimReward(initData) {
   const key = randomUUID();
   console.log(`  🎯 Claim mining (key: ${key.slice(0, 8)}...)`);
 
-  // Ambil balance SEBELUM claim
+  // Balance SEBELUM claim
   process.stdout.write("  💼 Cek balance awal... ");
   const before = await getBalance(initData);
-  console.log(before.ok ? `✅ ${before.balance !== null ? before.balance + " CRM" : "(parsing...)"}` : "❌");
+  if (before.authError) { console.log("❌ AUTH EXPIRED"); checkAuth(before.raw || {}); return; }
+  console.log(`✅ ${balanceLabel(before.balance)}`);
 
-  // Lakukan claim
+  // Kirim claim
   process.stdout.write("  🚀 Mengirim claim... ");
-  const r = await callEndpoint(
-    ENDPOINTS.CLAIM, initData,
-    ["idempotency_key"],
-    [{ t: 1, s: key }]
-  );
+  const r = await callEndpoint(ENDPOINTS.CLAIM, initData, ["idempotency_key"], [{ t: 1, s: key }]);
+  const parsed = parseResponse(r);
+
+  if (isAuthError(parsed)) {
+    console.log("❌ AUTH EXPIRED");
+    checkAuth(r);
+    return r;
+  }
 
   if (r.ok) {
     console.log("✅ BERHASIL!");
     const claimed = extractClaimedAmount(r);
 
-    // Ambil balance SETELAH claim
-    await sleep(1000); // tunggu server update
+    // Balance SETELAH claim
+    await sleep(1200);
     process.stdout.write("  💰 Cek balance akhir... ");
     const after = await getBalance(initData);
-    console.log(after.ok ? `✅ ${after.balance !== null ? after.balance + " CRM" : "(parsing...)"}` : "❌");
+    console.log(`✅ ${balanceLabel(after.balance)}`);
 
-    // Hitung selisih
     const diff = (before.balance !== null && after.balance !== null)
       ? parseFloat((after.balance - before.balance).toFixed(6))
       : claimed;
 
-    // Update session stats
     SESSION.balanceBefore = before.balance;
     SESSION.balanceAfter  = after.balance;
     SESSION.claimCount++;
     if (diff && diff > 0) SESSION.totalEarned = parseFloat((SESSION.totalEarned + diff).toFixed(6));
 
-    // Tampilkan ringkasan balance
-    printBalanceSummary(
-      "Claim Mining",
-      before.balance,
-      after.balance,
-      diff !== null && diff > 0 ? diff : claimed
-    );
-
-    if (CONFIG.VERBOSE) console.log("  Data:", JSON.stringify(r.data, null, 2));
+    printBalanceSummary(before.balance, after.balance, diff !== null && diff > 0 ? diff : claimed);
+    if (CONFIG.VERBOSE) console.log("  Parsed:", JSON.stringify(parsed, null, 2));
   } else {
-    console.log(`  ❌ Claim GAGAL (${r.status || r.error})`);
-    if (r.raw) console.log("  Detail:", r.raw.slice(0, 300));
+    console.log(`  ❌ GAGAL (${r.status || r.error})`);
   }
   return r;
 }
@@ -255,6 +349,8 @@ async function claimReward(initData) {
 async function energyBoost(initData) {
   process.stdout.write(`[${timestamp()}] ⚡ Energy Boost... `);
   const r = await callEndpoint(ENDPOINTS.ENERGY_BOOST, initData);
+  const parsed = parseResponse(r);
+  if (isAuthError(parsed)) { console.log("❌ AUTH EXPIRED"); checkAuth(r); return r; }
   console.log(r.ok ? "✅" : `❌ (${r.status || r.error})`);
   return r;
 }
@@ -264,18 +360,22 @@ async function claimMiningBoost(initData) {
 
   process.stdout.write("  💼 Cek balance awal... ");
   const before = await getBalance(initData);
-  console.log(before.ok ? `✅ ${before.balance !== null ? before.balance + " CRM" : "(parsing...)"}` : "❌");
+  if (before.authError) { console.log("❌ AUTH EXPIRED"); checkAuth({}); return; }
+  console.log(`✅ ${balanceLabel(before.balance)}`);
 
   process.stdout.write("  🚀 Mengirim boost claim... ");
   const r = await callEndpoint(ENDPOINTS.TASK_COMPLETE, initData);
+  const parsed = parseResponse(r);
+
+  if (isAuthError(parsed)) { console.log("❌ AUTH EXPIRED"); checkAuth(r); return r; }
 
   if (r.ok) {
     console.log("✅ BERHASIL!");
-    await sleep(1000);
+    await sleep(1200);
 
     process.stdout.write("  💰 Cek balance akhir... ");
     const after = await getBalance(initData);
-    console.log(after.ok ? `✅ ${after.balance !== null ? after.balance + " CRM" : "(parsing...)"}` : "❌");
+    console.log(`✅ ${balanceLabel(after.balance)}`);
 
     const diff = (before.balance !== null && after.balance !== null)
       ? parseFloat((after.balance - before.balance).toFixed(6)) : null;
@@ -283,7 +383,7 @@ async function claimMiningBoost(initData) {
     SESSION.balanceAfter = after.balance;
     if (diff && diff > 0) SESSION.totalEarned = parseFloat((SESSION.totalEarned + diff).toFixed(6));
 
-    printBalanceSummary("Mining Power Boost", before.balance, after.balance, diff);
+    printBalanceSummary(before.balance, after.balance, diff);
   } else {
     console.log(`  ❌ GAGAL (${r.status || r.error})`);
   }
@@ -312,9 +412,11 @@ async function completeTask(initData, task) {
     ["task_id"],
     [{ t: 1, s: String(task.id) }]
   );
+  const parsed = parseResponse(r);
+  if (isAuthError(parsed)) { console.log("❌ AUTH EXPIRED"); return r; }
   const reward = extractClaimedAmount(r);
   if (r.ok) {
-    console.log(`✅${reward !== null ? ` +${reward} CRM` : ""}`);
+    console.log(`✅${reward !== null && reward > 0 ? ` +${reward} CRM` : ""}`);
     if (reward && reward > 0) SESSION.totalEarned = parseFloat((SESSION.totalEarned + reward).toFixed(6));
   } else {
     console.log(`❌ (${r.status || r.error})`);
